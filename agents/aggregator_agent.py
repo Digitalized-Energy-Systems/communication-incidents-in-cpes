@@ -375,7 +375,7 @@ class AggregatorAgent(RoleAgent):
         self._negotiation_running = True
         # all 5 minutes
         self._seconds_running += 900.
-        self.container.clock.set_time(self._seconds_running)
+        #self.container.clock.set_time(self._seconds_running)
         self.add_role(NegotiationTerminationDetectorRole())
         agent_addr = self.agent_addrs[0][0]
         agent_id = self._agent_addrs[0][1]
