@@ -37,7 +37,7 @@ from pysimmods.util.date_util import GER
 def maximize_self_consumption(cs, target_params):
     """
     Target to maximize the self-consumption. Target is therefore 0, penalty is applied if renewable energies
-    are reduced. When obligations are received from grid agent, target is adapted accordingly.
+    are reduced. When obligations are received from operator agent, target is adapted accordingly.
     """
     penalty = target_params['penalty']
     sum_cs = cs.sum(axis=0)  # sum for each interval
@@ -68,7 +68,10 @@ def maximize_self_consumption(cs, target_params):
                         start = start[0:len(start) - 5]
     diff = np.abs(np.array(target) - sum_cs)  # deviation to the target schedule
     result = -np.sum(diff) - penalty
+   # total_max_target_deviation = np.sum(target_params["max_target_deviation"])
+    #norm_result = (result - 0) / (total_max_target_deviation * (1-1/target_params['n_agents']) - 0)
     return float(result)
+
 
 
 async def redispatch_scenario():
