@@ -112,17 +112,17 @@ class LoadAgent(UnitAgent):
             self.update_dates(start_date)
         power_forecast = []
         start = start_date + 'Z'
-        load_p = pd.read_hdf(MIDAS_DATA, "load_pmw")
+        load_p = pd.read_hdf(MIDAS_DATA, "load_pmw")[0]
         try:
-            data_q = pd.read_hdf(MIDAS_DATA, "load_qmvar")
+            data_q = pd.read_hdf(MIDAS_DATA, "load_qmvar")[0]
         except KeyError:
             # No q values for loads available. Skipping.
             data_q = None
         idx = 0
-        col = load_p.columns[idx]
+        # col = load_p[idx]
         rng = np.random.RandomState()
         model = DataModel(
-            data_p=load_p[col],
+            data_p=load_p,
             data_q=data_q,
             data_step_size=900,
             scaling=scaling,
