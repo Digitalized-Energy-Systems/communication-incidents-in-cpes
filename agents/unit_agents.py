@@ -2,19 +2,15 @@ import time
 import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict, Any
 
 import h5py
 import numpy as np
 import pandas as pd
+
+from agents.aggregation_role import AggregationRole
 from mango import RoleAgent
 from midas.util.base_data_model import DataModel
-
-from config import MIDAS_DATA, STEP_SIZE, PARAMS_BATT, INITS_BATT, SIMULATION_HOURS_IN_RESOLUTION, WD_PATH, T_AIR, WIND, \
-    PRESSURE, SCHEDULE_PERCENTAGES, BH, DH, SIMULATION_HOURS, NUMBER_OF_SCHEDULES_PER_AGENT
-from agents.flexibility_model import AdaptedFlexibilityModel
-from mango_library.negotiation.cohda.cohda_messages import StartCohdaNegotiationMessage
-from agents.messages import RedispatchFlexibilityRequest, RedispatchFlexibilityReply
 from pysimmods.buffer.batterysim import Battery
 from pysimmods.generator import WindPowerPlantSystem
 from pysimmods.generator.chplpgsim import CHPLPG
@@ -23,11 +19,22 @@ from pysimmods.generator.pvsystemsim import PVPlantSystem
 from pysimmods.generator.pvsystemsim.presets import pv_preset
 from pysimmods.generator.windsystemsim.presets import wind_presets
 from pysimmods.util.date_util import GER
+
+from agents.flexibility_model import AdaptedFlexibilityModel
+from agents.messages import RedispatchFlexibilityRequest, RedispatchFlexibilityReply, CoalitionAdaption, \
+    CallForExclusion, ReassignRole, Inactive
+from config import MIDAS_DATA, STEP_SIZE, PARAMS_BATT, INITS_BATT, SIMULATION_HOURS_IN_RESOLUTION, WD_PATH, T_AIR, WIND, \
+    PRESSURE, SCHEDULE_PERCENTAGES, BH, DH, SIMULATION_HOURS, NUMBER_OF_SCHEDULES_PER_AGENT, MULTI_LEVELLED
+from mango_library.coalition.core import CoalitionModel
+from mango_library.negotiation.cohda.cohda_messages import StartCohdaNegotiationMessage, CohdaNegotiationMessage
+from mango_library.negotiation.cohda.cohda_solution_aggregation import CohdaSolutionAggregationRole
+from mango_library.negotiation.termination import NegotiationTerminationDetectorRole
 from util import datetime_to_index
 
 
 class UnitAgent(RoleAgent):
-    def __init__(self, container, suggested_aid, schedule_provider=None):
+    def __init__(self, container, suggested_aid, schedule_provider=None, aggr_cont=None, obs=None, aggr=None,
+                 controller_addr=None, controller_aid=None):
         super().__init__(container, suggested_aid)
         self._flex_for_date = {}
         self._current_dates = ['0']
@@ -35,6 +42,16 @@ class UnitAgent(RoleAgent):
         self._obligations = {}
         self._hf = None
         self.container = container
+        self.exclusion_times = []
+        self.csv_path = f'{self.aid}_exclusion.csv'
+        self.observer_module = None
+        self.observer_active = False
+        self.ctr = 0
+        self.aggr_cont = aggr_cont
+        self.obs = obs
+        self.aggr = aggr
+        self.controller_addr = controller_addr
+        self.controller_aid = controller_aid
 
     def update_dates(self, start_date):
         self._current_dates = []
@@ -69,7 +86,36 @@ class UnitAgent(RoleAgent):
     def handle_message(self, content, meta):
         # This method defines what the agent will do with incoming messages.
         print(
-            f"UnitAgent {self.aid} received a message with the following content: {type(content)} at {self.container.clock.time}")
+            f"UnitAgent {self.aid} received a message with the following content: {type(content)} at {self.container.clock.time} from: {meta['sender_addr']}")
+        if isinstance(content, Inactive):
+            if MULTI_LEVELLED:
+                self.schedule_instant_acl_message(Inactive(),
+                                                  receiver_addr=self.controller_addr,
+                                                  receiver_id=self.controller_aid,
+                                                  acl_metadata={
+                                                      "sender_addr": self._context.addr,
+                                                      "sender_id": self.aid,
+                                                      "conversation_id": str(uuid.uuid4())
+                                                  }
+                                                  )
+            else:
+                for a_role in self.aggr.roles:
+                    if isinstance(a_role, NegotiationTerminationDetectorRole):
+                        term_detector = a_role
+                    term_detector._aggregator_addr = self.addr
+                    term_detector._aggregator_id = self.aid
+                    if isinstance(a_role, CohdaSolutionAggregationRole):
+                        sol_aggregation_role = a_role
+                    if isinstance(a_role, AggregationRole):
+                        aggr_role = a_role
+                self.add_role(term_detector)
+                self.add_role(sol_aggregation_role)
+                new_role = aggr_role  # ROLE_MAPPING[role](params[0], params[1], params[2], params[3])
+                new_role.agent_addrs = content.additional_params['agent_addrs']
+                new_role.term_detector = term_detector
+                # new_role.term_detector._participant_map = content.additional_params['participant_map']
+                self.add_role(new_role)
+
         if isinstance(content, RedispatchFlexibilityRequest):
             if content.dates[0] not in self._flex_for_date.keys():
                 self.calculate_redispatch_flexibility(content.dates[0])
@@ -92,14 +138,73 @@ class UnitAgent(RoleAgent):
                 if 'obligations' in content.target_params.keys():
                     for entry in content.target_params['obligations']:
                         self._obligations[entry[0]] = entry[1]
+            self.csv_path = self.csv_path + str(time.time())
+        if isinstance(content, CohdaNegotiationMessage):
+            if self.observer_module and not self.observer_active and self.ctr >= 3:
+                self.observer_active = True
+                self.observer_module.start_listening()
+            self.ctr += 1
+        if isinstance(content, CoalitionAdaption):
+            self.handle_adaption(content, meta)
+        if isinstance(content, CallForExclusion):
+            self.exclude_malicious_agent(content.malicious_agent, content.coalition_id)
+        if isinstance(content, ReassignRole):
+            for role, params in content.roles_and_params.items():
+                if role == AggregationRole.__name__:
+                    for a_role in self.aggr.roles:
+                        if isinstance(a_role, NegotiationTerminationDetectorRole):
+                            term_detector = a_role
+                        term_detector._aggregator_addr = self.addr
+                        term_detector._aggregator_id = self.aid
+                        if isinstance(a_role, CohdaSolutionAggregationRole):
+                            sol_aggregation_role = a_role
+                        if isinstance(a_role, AggregationRole):
+                            aggr_role = a_role
+                    self.add_role(term_detector)
+                    self.add_role(sol_aggregation_role)
+                    new_role = aggr_role  # ROLE_MAPPING[role](params[0], params[1], params[2], params[3])
+                    new_role.agent_addrs = content.additional_params['agent_addrs']
+                    new_role.term_detector = term_detector
+                    # new_role.term_detector._participant_map = content.additional_params['participant_map']
+                    self.add_role(new_role)
+
         super().handle_message(content, meta)
         self.store_msg_to_db(content, meta['conversation_id'])
+
+    def handle_adaption(
+            self, content: CoalitionAdaption, meta: Dict[str, Any]
+    ) -> None:
+        """Handle an incoming assignment to a coalition. Store the information in a CoalitionModel.
+
+        :param content: the assignment
+        :param meta: the meta data
+        """
+        assignment = self._role_context.get_or_create_model(CoalitionModel)
+        assignment.add(content.coalition_id, content)
+        assignment.controller_agent_id = content.controller_agent_id
+        assignment.controller_agent_addr = content.controller_agent_addr
+        self._role_context.update(assignment)
+        self.exclusion_times.append(self.container.clock.time)
+        pd.DataFrame(self.exclusion_times).to_csv(self.csv_path)
+
+    def exclude_malicious_agent(self, malicious_agent, coalition_id):
+        coalition_assignment = self._role_context.get_or_create_model(CoalitionModel).by_id(coalition_id)
+        for idx, neighbor in enumerate(coalition_assignment.neighbors):
+            if neighbor[1] == malicious_agent or neighbor[2] == malicious_agent:
+                del coalition_assignment.neighbors[idx]
+                break
+        self._role_context.update(coalition_assignment)
+        self.exclusion_times.append(self.container.clock.time)
+        pd.DataFrame(self.exclusion_times).to_csv(self.csv_path)
+        coalition_assignment = self._role_context.get_or_create_model(CoalitionModel).by_id(coalition_id)
 
 
 class LoadAgent(UnitAgent):
 
-    def __init__(self, container, suggested_aid, schedule_provider=None, scaling=1.0):
-        super().__init__(container, suggested_aid)
+    def __init__(self, container, suggested_aid, schedule_provider=None, scaling=1.0, controller_addr=None,
+                 controller_aid=None):
+        super().__init__(container=container, suggested_aid=suggested_aid, controller_addr=controller_addr,
+                         controller_aid=controller_aid)
         if schedule_provider is None:
             self.schedule_provider = self.schedule_provider_no_flexibility
         else:
@@ -113,17 +218,17 @@ class LoadAgent(UnitAgent):
             self.update_dates(start_date)
         power_forecast = []
         start = start_date + 'Z'
-        load_p = pd.read_hdf(MIDAS_DATA, "load_pmw")
+        load_p = pd.read_hdf(MIDAS_DATA, "load_pmw")[0]
         try:
-            data_q = pd.read_hdf(MIDAS_DATA, "load_qmvar")
+            data_q = pd.read_hdf(MIDAS_DATA, "load_qmvar")[0]
         except KeyError:
             # No q values for loads available. Skipping.
             data_q = None
         idx = 0
-        col = load_p.columns[idx]
+        # col = load_p[idx]
         rng = np.random.RandomState()
         model = DataModel(
-            data_p=load_p[col],
+            data_p=load_p,
             data_q=data_q,
             data_step_size=900,
             scaling=scaling,
@@ -168,8 +273,10 @@ class LoadAgent(UnitAgent):
 
 class CHPAgent(UnitAgent):
 
-    def __init__(self, container, suggested_aid, schedule_provider=None, kw=None):
-        super().__init__(container, suggested_aid)
+    def __init__(self, container, suggested_aid, schedule_provider=None, kw=None, controller_addr=None,
+                 controller_aid=None):
+        super().__init__(container=container, suggested_aid=suggested_aid, controller_addr=controller_addr,
+                         controller_aid=controller_aid)
         if schedule_provider is None:
             self.schedule_provider = self.schedule_provider_chp
         else:
@@ -261,8 +368,10 @@ class CHPAgent(UnitAgent):
 
 class BatteryAgent(UnitAgent):
 
-    def __init__(self, container, suggested_aid, schedule_provider=None, cap_kwh=None):
-        super().__init__(container, suggested_aid)
+    def __init__(self, container, suggested_aid, schedule_provider=None, cap_kwh=None, controller_addr=None,
+                 controller_aid=None):
+        super().__init__(container=container, suggested_aid=suggested_aid, controller_addr=controller_addr,
+                         controller_aid=controller_aid)
         if schedule_provider is None:
             self.schedule_provider = self.schedule_provider
         else:
@@ -342,8 +451,10 @@ class BatteryAgent(UnitAgent):
 
 class WindAgent(UnitAgent):
 
-    def __init__(self, container, suggested_aid, max_power=8, schedule_provider=None):
-        super().__init__(container, suggested_aid)
+    def __init__(self, container, suggested_aid, max_power=8, schedule_provider=None, aggr_cont=None, obs=None,
+                 aggr=None, controller_addr=None, controller_aid=None):
+        super().__init__(container=container, suggested_aid=suggested_aid, aggr_cont=aggr_cont, obs=obs, aggr=aggr,
+                         controller_addr=controller_addr, controller_aid=controller_aid)
         self._wind_system = WindPowerPlantSystem(*wind_presets(pn_max_kw=max_power))
         self._weather_data = pd.read_csv(WD_PATH, index_col=0)
         if schedule_provider is None:
@@ -352,6 +463,7 @@ class WindAgent(UnitAgent):
             self.schedule_provider = schedule_provider
         self._maximal_schedule_per_date = {}
         self._start_date = None
+        self.aggr = aggr
 
     def calculate_power_feed_in(self, date):
         if date != self._current_dates[0]:
@@ -431,8 +543,10 @@ class WindAgent(UnitAgent):
 
 class PVAgent(UnitAgent):
 
-    def __init__(self, container, suggested_aid, peak_power=8, schedule_provider=None):
-        super().__init__(container, suggested_aid)
+    def __init__(self, container, suggested_aid, peak_power=8, schedule_provider=None, controller_addr=None,
+                 controller_aid=None):
+        super().__init__(container=container, suggested_aid=suggested_aid, controller_addr=controller_addr,
+                         controller_aid=controller_aid)
         self._weather_data = pd.read_csv(WD_PATH, index_col=0)
         self._pv_system = PVPlantSystem(*pv_preset(p_peak_kw=peak_power, cos_phi=0.95))
         if schedule_provider is None:
