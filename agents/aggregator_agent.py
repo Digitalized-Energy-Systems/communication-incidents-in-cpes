@@ -1,120 +1,82 @@
-from datetime import datetime, timedelta
-from typing import Optional
+import logging
+import uuid
 
+import h5py
 import numpy as np
-import pandas as pd
 
-from pysimmods.other.flexibility.flexibilities import Flexibilities
-from pysimmods.other.flexibility.flexibility_model import FlexibilityModel
-from pysimmods.other.flexibility.schedule import Schedule
-from pysimmods.util.date_util import GER
+from agents.messages import Inactive
+from config import CENTRALIZED_CONTROL, DECENTRALIZED_CONTROL, MULTI_LEVELLED
+from mango import RoleAgent
+
+GER = "%Y-%m-%d %H:%M:%S"
+logger = logging.getLogger(__name__)
 
 
-class AdaptedFlexibilityModel(FlexibilityModel):
+class AggregatorAgent(RoleAgent):
 
-    def __init__(
-            self,
-            model,
-            unit="kw",
-            prioritize_setpoint: bool = False,
-            step_size: Optional[int] = None,
-            now_dt: Optional[datetime] = None,
-            forecast_horizon_hours=1,
-            seed=None,
-            store_min_and_max: bool = False,
-    ):
-        super().__init__(model=model, unit=unit, prioritize_setpoint=prioritize_setpoint,
-                         step_size=step_size, now_dt=now_dt, forecast_horizon_hours=forecast_horizon_hours,
-                         seed=seed, store_min_and_max=store_min_and_max)
+    def __init__(self, container, suggested_aid, controller, addrs=None):
+        super().__init__(container, suggested_aid=suggested_aid)
+        self.container = container
+        self._hf = None
+        self.exclusion_times = []
+        self.csv_path = f'{self.aid}_exclusion.csv'
+        self.controller = controller
+        self.addrs = addrs
 
-    def maximum_flex(self, start, flexibility_horizon_hours):
-        step_size = self._step_size
+    def handle_message(self, content, meta):
+        print('AGGR HANDLES; ', type(content))
+        super().handle_message(content, meta)
+        print(
+            f"AggregatorAgent {self.aid} received a message with the following content: {type(content)}, at: {self.container.clock.time} from {meta['sender_addr']}")
+        self.store_msg_to_db(content, meta['conversation_id'])
 
-        periods = int(flexibility_horizon_hours * 3_600 / step_size)
+        if isinstance(content, Inactive):
+            self.container.inactive = True
 
-        start_dt = datetime.strptime(start, GER)
-        end_dt = (
-                start_dt
-                + timedelta(hours=flexibility_horizon_hours)
-                - timedelta(seconds=step_size)
-        )
-        index = pd.date_range(start_dt, end_dt, periods=periods)
-        dataframe = pd.DataFrame(
-            columns=[
-                self._psetname,
-                self._qsetname,
-                self._pname,
-                self._qname,
-            ],
-            index=index,
-        )
-        dataframe[self._psetname] = [self.get_pn_max_kw() for _ in range(len(index))]
-        dataframe[self._qsetname] = [self.get_qn_max_kvar() for _ in range(len(index))]
+        if self.container._manipulation_number != np.inf:
+            print('TIME LEFT?')
+            print(self.addr, self.container._msg_counter, self.container._manipulation_number)
+        if self.container._msg_counter >= self.container._manipulation_number and self.container._attack_scenario == 10 and CENTRALIZED_CONTROL:
+            # timeout reached
+            print('NO MESSAGES! INFORM CONTROLLER')
+            self.schedule_instant_acl_message(Inactive(),
+                                              receiver_addr=self.controller[0],
+                                              receiver_id=self.controller[1],
+                                              acl_metadata={
+                                                  "sender_addr": self._context.addr,
+                                                  "sender_id": self.aid,
+                                                  "conversation_id": str(uuid.uuid4())
+                                              }
+                                              )
+            self.container._manipulation_number = np.inf
 
-        state_backup = self._model.get_state()
-        for index, row in dataframe.iterrows():
-            try:
-                self._calculate_step(
-                    index, row[self._psetname], row[self._qsetname]
-                )
-                dataframe.loc[index, self._pname] = (
-                        self._model.get_p_kw() * self._unit_factor
-                )
-                dataframe.loc[index, self._qname] = (
-                        self._model.get_q_kvar() * self._unit_factor
-                )
+        elif (
+                self.container._msg_counter >= self.container._manipulation_number and self.container._attack_scenario == 10 and MULTI_LEVELLED) \
+                or (
+                self.container._msg_counter >= self.container._manipulation_number and self.container._attack_scenario == 10 and DECENTRALIZED_CONTROL):
+            print('NO MESSAGES! INFORM OTHER AGENT', self.addrs)
+            self.schedule_instant_acl_message(Inactive(additional_params={'agent_addrs': self.addrs}),
+                                              receiver_addr=self.addrs[0][0],
+                                              receiver_id=self.addrs[0][1],
+                                              acl_metadata={
+                                                  "sender_addr": self._context.addr,
+                                                  "sender_id": self.aid,
+                                                  "conversation_id": str(uuid.uuid4())
+                                              }
+                                              )
+            self.container._manipulation_number = np.inf
 
-            except KeyError:
-                # Forecast is missing
-                dataframe.loc[index, self._pname] = np.nan
-                dataframe.loc[index, self._qname] = np.nan
-                dataframe.loc[index, self._psetname] = np.nan
-                dataframe.loc[index, self._qsetname] = np.nan
-        self._model.set_state(state_backup)
-        return Schedule().from_dataframe(dataframe)
-
-    def minimum_flex(self, start, flexibility_horizon_hours):
-        step_size = self._step_size
-
-        periods = int(flexibility_horizon_hours * 3_600 / step_size)
-
-        start_dt = datetime.strptime(start, GER)
-        end_dt = (
-                start_dt
-                + timedelta(hours=flexibility_horizon_hours)
-                - timedelta(seconds=step_size)
-        )
-        index = pd.date_range(start_dt, end_dt, periods=periods)
-        dataframe = pd.DataFrame(
-            columns=[
-                self._psetname,
-                self._qsetname,
-                self._pname,
-                self._qname,
-            ],
-            index=index,
-        )
-        dataframe[self._psetname] = [self.get_pn_min_kw() for _ in range(len(index))]
-        dataframe[self._qsetname] = [self.get_qn_min_kvar() for _ in range(len(index))]
-
-        state_backup = self._model.get_state()
-        for index, row in dataframe.iterrows():
-            try:
-                self._calculate_step(
-                    index, row[self._psetname], row[self._qsetname]
-                )
-                dataframe.loc[index, self._pname] = (
-                        self._model.get_p_kw() * self._unit_factor
-                )
-                dataframe.loc[index, self._qname] = (
-                        self._model.get_q_kvar() * self._unit_factor
-                )
-
-            except KeyError:
-                # Forecast is missing
-                dataframe.loc[index, self._pname] = np.nan
-                dataframe.loc[index, self._qname] = np.nan
-                dataframe.loc[index, self._psetname] = np.nan
-                dataframe.loc[index, self._qsetname] = np.nan
-        self._model.set_state(state_backup)
-        return Schedule().from_dataframe(dataframe)
+    def store_msg_to_db(self, content, m_id):
+        current_time = self.container.clock.time
+        self._hf = h5py.File(f'{self.aid}_rec_msg.h5', 'a')
+        try:
+            general_group = self._hf.create_group(f'{current_time}')
+        except ValueError:
+            general_group = self._hf.create_group(f'{current_time}_{str(uuid.uuid4())}')
+        self._hf.attrs['content'] = str(type(content))
+        general_group.attrs['content'] = str(type(content))
+        self._hf.attrs['m_id'] = str(m_id)
+        general_group.attrs['m_id'] = str(m_id)
+        general_group.create_dataset('time', data=np.float64(current_time))
+        general_group.attrs["aid"] = self.aid
+        self._hf.close()
