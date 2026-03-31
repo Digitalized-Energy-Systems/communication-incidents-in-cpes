@@ -20,4 +20,5 @@ pandapower==2.14.6
 pandas==2.2.1
 protobuf==3.13.0
 psutil==6.0.0
+setuptools
 simbench==1.4.0
